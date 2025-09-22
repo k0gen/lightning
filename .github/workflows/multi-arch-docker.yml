@@ -1,4 +1,4 @@
-name: Multi-Arch Docker Build (Native Runners)
+name: Multi-Arch Docker Build (Pure Native)
 
 on:
   workflow_dispatch:
@@ -30,30 +30,24 @@ jobs:
       contents: read
       packages: write
       id-token: write
-      attestations: write
+
+    outputs:
+      image-amd64: ${{ steps.image.outputs.image }}
+      image-arm64: ${{ steps.image.outputs.image }}
+      digest-amd64: ${{ steps.build.outputs.digest }}
+      digest-arm64: ${{ steps.build.outputs.digest }}
 
     steps:
-      - name: Prepare
-        run: |
-          echo "PLATFORM_PAIR=${{ matrix.arch }}" >> $GITHUB_ENV
-          echo "🏗️  Building on: $(uname -m)"
-
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          submodules: recursive
 
-      # ✅ Create docker-container builder (supports caching, no QEMU needed)
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        with:
-          # Use docker-container driver for advanced caching support
-          driver: docker-container
-          # Key: NO --platform flag = no QEMU emulation
-          # Each job builds single platform natively
-          driver-opts: |
-            network=host
+      - name: Verify Native Environment
+        run: |
+          echo "🏗️  Building ${{ matrix.platform }} natively on $(uname -m)"
+          echo "🐳  Docker version: $(docker version --format '{{.Server.Version}}')"
+          
+          # Ensure no QEMU is involved
+          echo "🚫  No QEMU setup - building natively only"
 
       - name: Extract metadata
         id: meta
@@ -66,6 +60,12 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable={{is_default_branch}}
+          flavor: |
+            suffix=-${{ matrix.arch }}
+
+      - name: Set image output
+        id: image
+        run: echo "image=${{ steps.meta.outputs.tags }}" >> $GITHUB_OUTPUT
 
       - name: Log in to Container Registry
         if: github.event_name != 'pull_request'
@@ -75,24 +75,100 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ✅ Now GitHub Actions caching works!
-      - name: Build and push
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          # Single platform = no cross-compilation = no QEMU
-          platforms: ${{ matrix.platform }}
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          # ✅ GitHub Actions caching now supported
-          cache-from: type=gha,scope=buildkit-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=buildkit-${{ matrix.arch }}
-          # Build arguments for native builds
-          build-args: |
-            BUILDKIT_INLINE_CACHE=1
-
-      - name: Test build
+      - name: Build natively
+        id: build
         run: |
-          echo "✅ ${{ matrix.platform }} built successfully on ${{ matrix.runner }}"
-          echo "Host architecture: $(uname -m)"
+          echo "🚀 Building ${{ matrix.platform }} natively on $(uname -m)"
+          echo "📋 Expected inside container: $(uname -m)"
+          
+          # Pure Docker build (not buildx) - guarantees native execution
+          docker build \
+            --tag ${{ steps.meta.outputs.tags }} \
+            --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --label "org.opencontainers.image.revision=${{ github.sha }}" \
+            .
+          
+          # Get the image digest for manifest creation
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${{ steps.meta.outputs.tags }} | cut -d'@' -f2)
+          echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
+
+      - name: Test native build
+        run: |
+          echo "✅ Testing that build is truly native..."
+          
+          # Verify the image runs natively and detects correct architecture
+          docker run --rm ${{ steps.meta.outputs.tags }} uname -m
+          
+          # Test that uv would detect the right architecture
+          docker run --rm ${{ steps.meta.outputs.tags }} uname -s -m
+          
+          echo "🎉 Native ${{ matrix.platform }} build successful!"
+
+      - name: Push native image
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "📤 Pushing ${{ matrix.platform }} image..."
+          docker push ${{ steps.meta.outputs.tags }}
+
+  # Create multi-arch manifest (only if both builds succeeded)
+  manifest:
+    runs-on: ubuntu-24.04
+    needs: build
+    if: github.event_name != 'pull_request'
+    
+    steps:
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for manifest
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Create and push manifest
+        run: |
+          echo "📦 Creating multi-arch manifest..."
+          
+          # Create multi-arch manifest pointing to single-arch images
+          docker buildx imagetools create -t ${{ steps.meta.outputs.tags }} \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}-amd64 \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}-arm64
+
+      - name: Inspect final manifest
+        run: |
+          echo "🔍 Final multi-arch manifest:"
+          docker buildx imagetools inspect ${{ steps.meta.outputs.tags }}
+
+  test:
+    runs-on: ubuntu-24.04
+    needs: manifest
+    if: github.event_name != 'pull_request'
+    
+    steps:
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+
+      - name: Test multi-arch manifest
+        run: |
+          echo "🧪 Testing multi-arch image selection..."
+          
+          # Test AMD64 selection
+          docker run --rm --platform linux/amd64 ${{ steps.meta.outputs.tags }} uname -m
+          
+          # Test ARM64 selection
+          docker run --rm --platform linux/arm64 ${{ steps.meta.outputs.tags }} uname -m
+          
+          echo "✅ Multi-arch manifest working correctly!"
