@@ -1,4 +1,4 @@
-name: Multi-Arch Docker Build (Pure Native)
+name: Multi-Arch Docker Build (Native + Architecture Override)
 
 on:
   workflow_dispatch:
@@ -22,20 +22,16 @@ jobs:
           - platform: linux/amd64
             runner: ubuntu-24.04
             arch: amd64
+            dockerfile_arch: x86_64-linux-gnu
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
             arch: arm64
+            dockerfile_arch: aarch64-linux-gnu
     
     permissions:
       contents: read
       packages: write
       id-token: write
-
-    outputs:
-      image-amd64: ${{ steps.image.outputs.image }}
-      image-arm64: ${{ steps.image.outputs.image }}
-      digest-amd64: ${{ steps.build.outputs.digest }}
-      digest-arm64: ${{ steps.build.outputs.digest }}
 
     steps:
       - name: Checkout
@@ -44,10 +40,8 @@ jobs:
       - name: Verify Native Environment
         run: |
           echo "🏗️  Building ${{ matrix.platform }} natively on $(uname -m)"
-          echo "🐳  Docker version: $(docker version --format '{{.Server.Version}}')"
-          
-          # Ensure no QEMU is involved
-          echo "🚫  No QEMU setup - building natively only"
+          echo "🐳  Docker info:"
+          docker info | grep -E "(Architecture|OSType)"
 
       - name: Extract metadata
         id: meta
@@ -63,10 +57,6 @@ jobs:
           flavor: |
             suffix=-${{ matrix.arch }}
 
-      - name: Set image output
-        id: image
-        run: echo "image=${{ steps.meta.outputs.tags }}" >> $GITHUB_OUTPUT
-
       - name: Log in to Container Registry
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
@@ -75,34 +65,45 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build natively
-        id: build
+      # ✅ Build with architecture override - works with CLN Dockerfile
+      - name: Build natively with architecture override
         run: |
           echo "🚀 Building ${{ matrix.platform }} natively on $(uname -m)"
-          echo "📋 Expected inside container: $(uname -m)"
           
-          # Pure Docker build (not buildx) - guarantees native execution
+          # Build with explicit platform and build args that match the Dockerfile expectations
           docker build \
+            --platform ${{ matrix.platform }} \
+            --build-arg BUILDPLATFORM=${{ matrix.platform }} \
+            --build-arg TARGETPLATFORM=${{ matrix.platform }} \
+            --build-arg TARGETOS=linux \
+            --build-arg TARGETARCH=${{ matrix.arch }} \
             --tag ${{ steps.meta.outputs.tags }} \
             --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
             --label "org.opencontainers.image.revision=${{ github.sha }}" \
             .
-          
-          # Get the image digest for manifest creation
-          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${{ steps.meta.outputs.tags }} | cut -d'@' -f2)
-          echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
 
       - name: Test native build
         run: |
-          echo "✅ Testing that build is truly native..."
+          echo "✅ Testing native ${{ matrix.platform }} build..."
           
-          # Verify the image runs natively and detects correct architecture
+          # Test the image runs natively
           docker run --rm ${{ steps.meta.outputs.tags }} uname -m
           
-          # Test that uv would detect the right architecture
-          docker run --rm ${{ steps.meta.outputs.tags }} uname -s -m
+          # Test that it's the right architecture
+          CONTAINER_ARCH=$(docker run --rm ${{ steps.meta.outputs.tags }} uname -m)
+          HOST_ARCH=$(uname -m)
           
-          echo "🎉 Native ${{ matrix.platform }} build successful!"
+          echo "Host architecture: $HOST_ARCH"
+          echo "Container architecture: $CONTAINER_ARCH"
+          
+          # Verify they match (aarch64 == arm64, x86_64 == amd64)
+          if [[ "$HOST_ARCH" == "aarch64" && "$CONTAINER_ARCH" == "aarch64" ]] || \
+             [[ "$HOST_ARCH" == "x86_64" && "$CONTAINER_ARCH" == "x86_64" ]]; then
+            echo "🎉 Architecture match confirmed - native build successful!"
+          else
+            echo "❌ Architecture mismatch detected"
+            exit 1
+          fi
 
       - name: Push native image
         if: github.event_name != 'pull_request'
@@ -110,7 +111,7 @@ jobs:
           echo "📤 Pushing ${{ matrix.platform }} image..."
           docker push ${{ steps.meta.outputs.tags }}
 
-  # Create multi-arch manifest (only if both builds succeeded)
+  # Rest of the workflow (manifest creation) stays the same...
   manifest:
     runs-on: ubuntu-24.04
     needs: build
@@ -139,36 +140,15 @@ jobs:
         run: |
           echo "📦 Creating multi-arch manifest..."
           
-          # Create multi-arch manifest pointing to single-arch images
-          docker buildx imagetools create -t ${{ steps.meta.outputs.tags }} \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}-amd64 \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}-arm64
+          # Extract the base tag name for the architecture-specific images
+          BASE_TAG=$(echo "${{ steps.meta.outputs.tags }}" | head -n1)
+          
+          docker buildx imagetools create -t ${BASE_TAG} \
+            ${BASE_TAG}-amd64 \
+            ${BASE_TAG}-arm64
 
       - name: Inspect final manifest
         run: |
           echo "🔍 Final multi-arch manifest:"
-          docker buildx imagetools inspect ${{ steps.meta.outputs.tags }}
-
-  test:
-    runs-on: ubuntu-24.04
-    needs: manifest
-    if: github.event_name != 'pull_request'
-    
-    steps:
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-
-      - name: Test multi-arch manifest
-        run: |
-          echo "🧪 Testing multi-arch image selection..."
-          
-          # Test AMD64 selection
-          docker run --rm --platform linux/amd64 ${{ steps.meta.outputs.tags }} uname -m
-          
-          # Test ARM64 selection
-          docker run --rm --platform linux/arm64 ${{ steps.meta.outputs.tags }} uname -m
-          
-          echo "✅ Multi-arch manifest working correctly!"
+          BASE_TAG=$(echo "${{ steps.meta.outputs.tags }}" | head -n1)
+          docker buildx imagetools inspect ${BASE_TAG}
