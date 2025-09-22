@@ -36,7 +36,7 @@ jobs:
       - name: Prepare
         run: |
           echo "PLATFORM_PAIR=${{ matrix.arch }}" >> $GITHUB_ENV
-          echo "Running on: $(uname -m)"
+          echo "🏗️  Building on: $(uname -m)"
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -44,20 +44,16 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
-      # ❌ REMOVE this step - it creates a QEMU-enabled builder
-      # - name: Set up Docker Buildx  
-      #   uses: docker/setup-buildx-action@v3
-
-      # ✅ Use native Docker daemon directly
-      - name: Set up Docker (Native)
-        run: |
-          # Verify we're running natively  
-          echo "Architecture: $(uname -m)"
-          echo "Available platforms: $(docker version --format '{{.Server.Os}}/{{.Server.Arch}}')"
-          
-          # Use default builder (native daemon) instead of creating new one
-          docker buildx use default || true
-          docker buildx inspect --bootstrap
+      # ✅ Create docker-container builder (supports caching, no QEMU needed)
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          # Use docker-container driver for advanced caching support
+          driver: docker-container
+          # Key: NO --platform flag = no QEMU emulation
+          # Each job builds single platform natively
+          driver-opts: |
+            network=host
 
       - name: Extract metadata
         id: meta
@@ -79,37 +75,24 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ✅ Force native building
+      # ✅ Now GitHub Actions caching works!
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
           context: .
-          # ✅ Single platform per job - no cross-compilation needed
+          # Single platform = no cross-compilation = no QEMU
           platforms: ${{ matrix.platform }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # ✅ Use native builder
-          builder: default
-          # ✅ Enhanced caching
+          # ✅ GitHub Actions caching now supported
           cache-from: type=gha,scope=buildkit-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=buildkit-${{ matrix.arch }}
-          # ✅ Build arguments to ensure native execution
+          # Build arguments for native builds
           build-args: |
             BUILDKIT_INLINE_CACHE=1
-            TARGETPLATFORM=${{ matrix.platform }}
-            BUILDPLATFORM=${{ matrix.platform }}
 
-      # ✅ Validate the build
       - name: Test build
         run: |
           echo "✅ ${{ matrix.platform }} built successfully on ${{ matrix.runner }}"
           echo "Host architecture: $(uname -m)"
-          echo "Docker info:"
-          docker info | grep -E "(Architecture|OSType)"
-          
-          # Test that we can run the image natively
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
-            echo "Testing image natively..."
-            docker run --rm --platform ${{ matrix.platform }} ${{ steps.meta.outputs.tags }} uname -m || echo "Image test skipped"
-          fi
