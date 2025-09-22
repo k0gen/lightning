@@ -1,4 +1,4 @@
-name: Multi-Arch Docker Build (Native + Architecture Override)
+name: Multi-Arch Docker Build (Minimal Buildx)
 
 on:
   workflow_dispatch:
@@ -22,11 +22,9 @@ jobs:
           - platform: linux/amd64
             runner: ubuntu-24.04
             arch: amd64
-            dockerfile_arch: x86_64-linux-gnu
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
             arch: arm64
-            dockerfile_arch: aarch64-linux-gnu
     
     permissions:
       contents: read
@@ -40,8 +38,23 @@ jobs:
       - name: Verify Native Environment
         run: |
           echo "🏗️  Building ${{ matrix.platform }} natively on $(uname -m)"
-          echo "🐳  Docker info:"
-          docker info | grep -E "(Architecture|OSType)"
+
+      # ✅ Minimal buildx setup - native platform only
+      - name: Set up Docker Buildx (Native Only)
+        run: |
+          # Create a builder for ONLY the current platform - no QEMU
+          docker buildx create \
+            --name native-builder \
+            --driver docker-container \
+            --platform ${{ matrix.platform }} \
+            --use
+          
+          # Bootstrap and verify
+          docker buildx inspect --bootstrap
+          
+          # Confirm no QEMU platforms
+          echo "Builder platforms:"
+          docker buildx inspect | grep Platforms
 
       - name: Extract metadata
         id: meta
@@ -54,8 +67,6 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable={{is_default_branch}}
-          flavor: |
-            suffix=-${{ matrix.arch }}
 
       - name: Log in to Container Registry
         if: github.event_name != 'pull_request'
@@ -65,90 +76,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ✅ Build with architecture override - works with CLN Dockerfile
-      - name: Build natively with architecture override
-        run: |
-          echo "🚀 Building ${{ matrix.platform }} natively on $(uname -m)"
-          
-          # Build with explicit platform and build args that match the Dockerfile expectations
-          docker build \
-            --platform ${{ matrix.platform }} \
-            --build-arg BUILDPLATFORM=${{ matrix.platform }} \
-            --build-arg TARGETPLATFORM=${{ matrix.platform }} \
-            --build-arg TARGETOS=linux \
-            --build-arg TARGETARCH=${{ matrix.arch }} \
-            --tag ${{ steps.meta.outputs.tags }} \
-            --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
-            --label "org.opencontainers.image.revision=${{ github.sha }}" \
-            .
-
-      - name: Test native build
-        run: |
-          echo "✅ Testing native ${{ matrix.platform }} build..."
-          
-          # Test the image runs natively
-          docker run --rm ${{ steps.meta.outputs.tags }} uname -m
-          
-          # Test that it's the right architecture
-          CONTAINER_ARCH=$(docker run --rm ${{ steps.meta.outputs.tags }} uname -m)
-          HOST_ARCH=$(uname -m)
-          
-          echo "Host architecture: $HOST_ARCH"
-          echo "Container architecture: $CONTAINER_ARCH"
-          
-          # Verify they match (aarch64 == arm64, x86_64 == amd64)
-          if [[ "$HOST_ARCH" == "aarch64" && "$CONTAINER_ARCH" == "aarch64" ]] || \
-             [[ "$HOST_ARCH" == "x86_64" && "$CONTAINER_ARCH" == "x86_64" ]]; then
-            echo "🎉 Architecture match confirmed - native build successful!"
-          else
-            echo "❌ Architecture mismatch detected"
-            exit 1
-          fi
-
-      - name: Push native image
-        if: github.event_name != 'pull_request'
-        run: |
-          echo "📤 Pushing ${{ matrix.platform }} image..."
-          docker push ${{ steps.meta.outputs.tags }}
-
-  # Rest of the workflow (manifest creation) stays the same...
-  manifest:
-    runs-on: ubuntu-24.04
-    needs: build
-    if: github.event_name != 'pull_request'
-    
-    steps:
-      - name: Log in to Container Registry
-        uses: docker/login-action@v3
+      # ✅ Use buildx but ONLY for the native platform
+      - name: Build and push
+        uses: docker/build-push-action@v5
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          context: .
+          # ✅ Single platform only - no cross-compilation
+          platforms: ${{ matrix.platform }}
+          builder: native-builder
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # No caching for now to avoid complexity
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
 
-      - name: Extract metadata for manifest
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable={{is_default_branch}}
-
-      - name: Create and push manifest
+      - name: Test build
         run: |
-          echo "📦 Creating multi-arch manifest..."
-          
-          # Extract the base tag name for the architecture-specific images
-          BASE_TAG=$(echo "${{ steps.meta.outputs.tags }}" | head -n1)
-          
-          docker buildx imagetools create -t ${BASE_TAG} \
-            ${BASE_TAG}-amd64 \
-            ${BASE_TAG}-arm64
-
-      - name: Inspect final manifest
-        run: |
-          echo "🔍 Final multi-arch manifest:"
-          BASE_TAG=$(echo "${{ steps.meta.outputs.tags }}" | head -n1)
-          docker buildx imagetools inspect ${BASE_TAG}
+          echo "✅ ${{ matrix.platform }} built successfully on ${{ matrix.runner }}"
